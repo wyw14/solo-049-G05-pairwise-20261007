@@ -16,6 +16,7 @@ type Health struct {
 	Now        time.Time         `json:"now"`
 	StateRoot  string            `json:"state_root"`
 	Components map[string]string `json:"components"`
+	ClockTrust string            `json:"clock_trust"`
 	Passes     int               `json:"passes"`
 	Antennas   int               `json:"antennas"`
 	RFChains   int               `json:"rf_chains"`

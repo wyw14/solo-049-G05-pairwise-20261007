@@ -74,6 +74,31 @@ func (m *DeadlineManager) Get(passID string) (Deadline, bool) {
 	return deadline, found
 }
 
+// List returns a snapshot of every scheduled deadline, newest-independent order.
+func (m *DeadlineManager) List() []Deadline {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	deadlines := make([]Deadline, 0, len(m.deadlines))
+	for _, deadline := range m.deadlines {
+		deadlines = append(deadlines, deadline)
+	}
+	return deadlines
+}
+
+// ActiveSet identifies passes running on monotonic time, whose scheduled
+// civil-time timestamps must not be shifted.
+func (m *DeadlineManager) ActiveSet() map[string]bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	active := make(map[string]bool)
+	for _, deadline := range m.deadlines {
+		if deadline.Phase == Tracking || deadline.Phase == Draining {
+			active[deadline.PassID] = true
+		}
+	}
+	return active
+}
+
 func (m *DeadlineManager) Remaining(passID string) (time.Duration, error) {
 	deadline, found := m.Get(passID)
 	if !found || deadline.MonotonicLOS.IsZero() {

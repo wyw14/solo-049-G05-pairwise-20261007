@@ -98,3 +98,30 @@ func (q *CommandQueue) List(passID string) []PointingCommand {
 	}
 	return values
 }
+
+// ShiftCivil moves live pointing-command timestamps by a civil-time correction.
+// Commands belonging to active passes (tracking/draining) are left on monotonic
+// time, and retired revisions are never touched. Returns the count shifted.
+func (q *CommandQueue) ShiftCivil(delta time.Duration, activePasses map[string]bool) (int, error) {
+	if delta == 0 {
+		return 0, nil
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	shifted := 0
+	for index := range q.commands {
+		command := &q.commands[index]
+		if command.Retired || activePasses[command.PassID] {
+			continue
+		}
+		command.ExecuteAt = command.ExecuteAt.Add(delta)
+		shifted++
+	}
+	if shifted == 0 {
+		return 0, nil
+	}
+	if err := store.WriteJSON(q.path, q.commands); err != nil {
+		return 0, err
+	}
+	return shifted, nil
+}

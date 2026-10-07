@@ -29,6 +29,7 @@ type Runtime struct {
 	Catalog          *satellite.Catalog
 	Ephemerides      *satellite.EphemerisService
 	Clock            *stationclock.Service
+	ClockQuality     *stationclock.QualityService
 	Windows          *store.WindowStore
 	Timeline         *scheduler.Timeline
 	Commands         *scheduler.CommandQueue
@@ -104,6 +105,21 @@ func NewRuntime(stateRoot string) (*Runtime, error) {
 	replanner := passsvc.NewReplanner(passes, windowRecompute, commands, trail)
 	extensions := passsvc.NewExtensionService(passes, timeline, fleet, trail)
 	deadlines := passsvc.NewDeadlineManager(clockService)
+	clockQuality, err := stationclock.NewQualityService(paths, clockService, trail)
+	if err != nil {
+		return nil, err
+	}
+	clockQuality.BindScheduling(deadlineClockView{deadlines: deadlines}, pointingClockView{queue: commands})
+	clockService.Subscribe(func(correction stationclock.Correction) {
+		shifted, err := commands.ShiftCivil(correction.Delta, deadlines.ActiveSet())
+		if err != nil {
+			_, _ = trail.Record(audit.Event{Component: "clock", Action: "pointing.shift_failed", Severity: audit.Warning, Subject: correction.ID, Fields: map[string]any{"error": err.Error(), "delta_ns": correction.Delta.Nanoseconds()}})
+			return
+		}
+		if shifted > 0 {
+			_, _ = trail.Record(audit.Event{Component: "clock", Action: "pointing.shifted", Subject: correction.ID, Fields: map[string]any{"delta_ns": correction.Delta.Nanoseconds(), "commands": shifted}})
+		}
+	})
 	unlocker := receiver.NewUnlocker(trail)
 	finalizer := passsvc.NewFinalizer(passes, recorderManager, unlocker, trail, 250*time.Millisecond)
 	attempts, err := receiver.NewAttemptDispatcher(paths, trail)
@@ -117,7 +133,7 @@ func NewRuntime(stateRoot string) (*Runtime, error) {
 	weatherCoordinator := weather.NewCoordinator(20, rfController, stower, passes, trail)
 	runtime := &Runtime{
 		StateRoot: stateRoot, Paths: paths, EventLog: log, Audit: trail, Catalog: catalog, Ephemerides: ephemerides,
-		Clock: clockService, Windows: windows, Timeline: timeline, Commands: commands,
+		Clock: clockService, ClockQuality: clockQuality, Windows: windows, Timeline: timeline, Commands: commands,
 		Reservations: scheduler.NewReservationPlanner(windows, timeline, 30*time.Second),
 		Antennas:     fleet, Executor: antenna.NewExecutor(fleet, commands, trail), Stower: stower,
 		RF: rfController, Recorder: recorderManager, Passes: passes, WindowRecompute: windowRecompute,
@@ -140,6 +156,13 @@ func (r *Runtime) Health() console.Health {
 			components["scheduler"] = "active-owner"
 		}
 	}
+	estimate := r.ClockQuality.Estimate()
+	if estimate.SourceCount > 0 {
+		components["clock"] = string(estimate.Trust)
+	}
+	if len(r.ClockQuality.Reviews(true)) > 0 {
+		components["clock"] = "manual-review"
+	}
 	for _, value := range r.Passes.List() {
 		if value.Phase == passsvc.Tracking {
 			if remaining, err := r.Deadlines.Remaining(value.ID); err == nil && remaining > 0 {
@@ -148,8 +171,8 @@ func (r *Runtime) Health() console.Health {
 		}
 	}
 	return console.Health{Status: "ok", Service: "orbitlink", Now: r.Clock.Now(), StateRoot: r.StateRoot,
-		Components: components,
-		Passes:     len(r.Passes.List()), Antennas: len(r.Antennas.List()), RFChains: len(r.RF.List()), Recordings: len(r.Recorder.List())}
+		Components: components, ClockTrust: string(estimate.Trust),
+		Passes: len(r.Passes.List()), Antennas: len(r.Antennas.List()), RFChains: len(r.RF.List()), Recordings: len(r.Recorder.List())}
 }
 
 func (r *Runtime) NewDecoderSession(passID, segmentID string) (*receiver.Session, error) {

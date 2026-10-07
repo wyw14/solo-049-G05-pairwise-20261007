@@ -94,11 +94,65 @@ func TestEphemerisClockAndWindSafetyFlow(t *testing.T) {
 	if len(commands) == 0 || commands[len(commands)-1].Revision != previous.Revision+1 {
 		t.Fatal("revised pointing commands were not queued")
 	}
-	if _, err := runtime.Clock.Apply(stationclock.Sample{ObservedAt: time.Now().UTC(), Offset: 2 * time.Second, Source: "gps", Quality: "locked"}); err != nil {
+	// A small forward slew is applied automatically.
+	if _, err := runtime.Clock.Apply(stationclock.Sample{ObservedAt: time.Now().UTC(), Offset: 50 * time.Millisecond, Source: "gps", Quality: "locked"}); err != nil {
 		t.Fatal(err)
 	}
-	if len(runtime.Clock.Corrections()) != 1 {
-		t.Fatal("clock correction was not persisted")
+	deadlineBefore, _ := runtime.Deadlines.Get(value.ID)
+	pointingBefore := runtime.Commands.List(value.ID)
+	// A large correction is held for manual review and leaves the offset untouched.
+	held, err := runtime.ClockQuality.Ingest(stationclock.Sample{ObservedAt: time.Now().UTC(), Offset: 2 * time.Second, Source: "gps", Quality: "locked"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if held.Strategy != stationclock.StrategyReview || held.Review == nil {
+		t.Fatalf("large correction was not held for review: %#v", held)
+	}
+	if runtime.Clock.Offset() != 50*time.Millisecond {
+		t.Fatal("pending review must not change the live offset")
+	}
+	if deadlineMid, _ := runtime.Deadlines.Get(value.ID); !deadlineMid.CivilLOS.Equal(deadlineBefore.CivilLOS) {
+		t.Fatal("pending review must not move pass deadlines")
+	}
+	impact, err := runtime.ClockQuality.Impact(held.Review.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(impact.Passes) == 0 {
+		t.Fatal("review impact should list the seeded pass")
+	}
+	if _, _, err := runtime.ClockQuality.Approve(held.Review.ID, "operator", "verified against GNSS"); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.Clock.Offset() != 2*time.Second {
+		t.Fatal("approved review did not apply the correction")
+	}
+	if len(runtime.Clock.Corrections()) != 2 {
+		t.Fatal("clock corrections were not persisted")
+	}
+	// Approval propagates to the civil deadline and live pointing commands;
+	// active windows remain monotonic (the seeded pass is still planned).
+	delta := 2*time.Second - 50*time.Millisecond
+	deadlineAfter, _ := runtime.Deadlines.Get(value.ID)
+	if deadlineAfter.CivilLOS.Sub(deadlineBefore.CivilLOS) != delta {
+		t.Fatalf("deadline moved by %s, want %s", deadlineAfter.CivilLOS.Sub(deadlineBefore.CivilLOS), delta)
+	}
+	for _, before := range pointingBefore {
+		if before.Retired {
+			continue
+		}
+		found := false
+		for _, after := range runtime.Commands.List(value.ID) {
+			if after.ID == before.ID {
+				found = true
+				if after.ExecuteAt.Sub(before.ExecuteAt) != delta {
+					t.Fatalf("pointing %s moved by %s, want %s", after.ID, after.ExecuteAt.Sub(before.ExecuteAt), delta)
+				}
+			}
+		}
+		if !found {
+			t.Fatalf("pointing command %s vanished after correction", before.ID)
+		}
 	}
 	if err := runtime.RF.EnableTransmit("RF-01"); err != nil {
 		t.Fatal(err)
@@ -121,6 +175,70 @@ func TestRouterRejectsOverlappingReservation(t *testing.T) {
 	}
 	if _, err := runtime.Reservations.ReservePass(second.ID, second.AntennaID); err == nil {
 		t.Fatal("overlapping reservation unexpectedly succeeded")
+	}
+}
+
+func TestClockReviewHTTPFlow(t *testing.T) {
+	runtime := newTestRuntime(t)
+	router, err := NewRouter(runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewServer(router)
+	defer server.Close()
+
+	// Small forward slew applies straight away.
+	response := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/clock/samples",
+		`{"source":"gnss","quality":"locked","offset":"20ms"}`)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("small slew returned %d", response.StatusCode)
+	}
+	response.Body.Close()
+
+	// Large step is held: 202 with a review.
+	response = requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/clock/samples",
+		`{"source":"ntp","quality":"synced","offset_ns":2000000000}`)
+	if response.StatusCode != http.StatusAccepted {
+		t.Fatalf("large step returned %d, want 202", response.StatusCode)
+	}
+	var decision struct {
+		Strategy string `json:"strategy"`
+		Review   struct {
+			ID string `json:"id"`
+		} `json:"review"`
+	}
+	decodeBody(t, response, &decision)
+	if decision.Strategy != "manual_review" || decision.Review.ID == "" {
+		t.Fatalf("unexpected decision: %#v", decision)
+	}
+
+	impactResponse, err := server.Client().Get(server.URL + "/api/clock/reviews/" + decision.Review.ID + "/impact")
+	if err != nil || impactResponse.StatusCode != http.StatusOK {
+		t.Fatalf("impact fetch failed: %v %d", err, impactResponse.StatusCode)
+	}
+	impactResponse.Body.Close()
+
+	approve := requestJSON(t, server.Client(), http.MethodPost,
+		server.URL+"/api/clock/reviews/"+decision.Review.ID+"/approve",
+		`{"reviewer":"ops-lead","note":"cross-checked"}`)
+	if approve.StatusCode != http.StatusOK {
+		t.Fatalf("approval returned %d", approve.StatusCode)
+	}
+	approve.Body.Close()
+
+	correctionsResponse, err := server.Client().Get(server.URL + "/api/clock/corrections")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var corrections struct {
+		Items []struct {
+			After int64 `json:"after"`
+		} `json:"items"`
+	}
+	decodeBody(t, correctionsResponse, &corrections)
+	last := corrections.Items[len(corrections.Items)-1]
+	if last.After != int64(2*time.Second) {
+		t.Fatalf("approved correction not applied: after=%d", last.After)
 	}
 }
 

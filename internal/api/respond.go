@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 
+	stationclock "orbitlink/internal/clock"
 	"orbitlink/internal/scheduler"
 )
 
@@ -29,6 +30,9 @@ func writeError(writer http.ResponseWriter, err error) {
 	status := http.StatusUnprocessableEntity
 	var conflict *scheduler.ConflictError
 	if errors.As(err, &conflict) {
+		status = http.StatusConflict
+	}
+	if errors.Is(err, stationclock.ErrManualReviewRequired) {
 		status = http.StatusConflict
 	}
 	writeJSON(writer, status, map[string]any{"error": err.Error(), "status": status})
