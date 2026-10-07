@@ -48,6 +48,13 @@ func (s *Service) MonotonicDeadline(duration time.Duration) time.Time {
 	return time.Now().Add(duration)
 }
 
+// Offset reports the currently applied civil-time correction.
+func (s *Service) Offset() time.Duration {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.offset
+}
+
 func (s *Service) Subscribe(observer Observer) {
 	s.mu.Lock()
 	s.observers = append(s.observers, observer)

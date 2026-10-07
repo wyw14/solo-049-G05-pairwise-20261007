@@ -29,6 +29,7 @@ type Runtime struct {
 	Catalog          *satellite.Catalog
 	Ephemerides      *satellite.EphemerisService
 	Clock            *stationclock.Service
+	ClockMonitor     *stationclock.Monitor
 	Windows          *store.WindowStore
 	Timeline         *scheduler.Timeline
 	Commands         *scheduler.CommandQueue
@@ -69,6 +70,10 @@ func NewRuntime(stateRoot string) (*Runtime, error) {
 		return nil, err
 	}
 	clockService, err := stationclock.NewService(paths, trail)
+	if err != nil {
+		return nil, err
+	}
+	clockMonitor, err := stationclock.NewMonitor(paths, clockService, trail, stationclock.DefaultPolicy())
 	if err != nil {
 		return nil, err
 	}
@@ -117,7 +122,7 @@ func NewRuntime(stateRoot string) (*Runtime, error) {
 	weatherCoordinator := weather.NewCoordinator(20, rfController, stower, passes, trail)
 	runtime := &Runtime{
 		StateRoot: stateRoot, Paths: paths, EventLog: log, Audit: trail, Catalog: catalog, Ephemerides: ephemerides,
-		Clock: clockService, Windows: windows, Timeline: timeline, Commands: commands,
+		Clock: clockService, ClockMonitor: clockMonitor, Windows: windows, Timeline: timeline, Commands: commands,
 		Reservations: scheduler.NewReservationPlanner(windows, timeline, 30*time.Second),
 		Antennas:     fleet, Executor: antenna.NewExecutor(fleet, commands, trail), Stower: stower,
 		RF: rfController, Recorder: recorderManager, Passes: passes, WindowRecompute: windowRecompute,
@@ -126,6 +131,25 @@ func NewRuntime(stateRoot string) (*Runtime, error) {
 		Handovers: handovers, Weather: weatherCoordinator, receiverSessions: make(map[string]*receiver.Session),
 	}
 	ephemerides.Subscribe(replanner.ApplyRevision)
+	// Applied clock corrections move future pointing commands along with the
+	// civil timeline; passes that are actively tracking or draining are
+	// excluded so an in-flight window never shifts under the antenna.
+	clockService.Subscribe(func(correction stationclock.Correction) {
+		active := map[string]bool{}
+		for _, value := range passes.List() {
+			if value.Phase == passsvc.Tracking || value.Phase == passsvc.Draining {
+				active[value.ID] = true
+			}
+		}
+		shifted, err := commands.ShiftFuture(time.Now().UTC(), correction.Delta, active)
+		if err != nil {
+			_, _ = trail.Record(audit.Event{Component: "scheduler", Action: "pointing.shift_failed", Severity: audit.Warning, Fields: map[string]any{"error": err.Error(), "delta_ns": correction.Delta.Nanoseconds()}})
+			return
+		}
+		if shifted > 0 {
+			_, _ = trail.Record(audit.Event{Component: "scheduler", Action: "pointing.shifted", Fields: map[string]any{"delta_ns": correction.Delta.Nanoseconds(), "commands": shifted, "active_passes_excluded": len(active)}})
+		}
+	})
 	if err := runtime.seed(); err != nil {
 		return nil, err
 	}
@@ -146,6 +170,9 @@ func (r *Runtime) Health() console.Health {
 				components["clock"] = "monotonic-active"
 			}
 		}
+	}
+	if r.ClockMonitor.PendingCount() > 0 {
+		components["clock"] = "review-pending"
 	}
 	return console.Health{Status: "ok", Service: "orbitlink", Now: r.Clock.Now(), StateRoot: r.StateRoot,
 		Components: components,

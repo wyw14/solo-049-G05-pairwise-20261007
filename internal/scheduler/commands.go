@@ -87,6 +87,37 @@ func (q *CommandQueue) IsExecutable(command PointingCommand) bool {
 	return !command.Retired && command.Revision == q.active[command.PassID]
 }
 
+// ShiftFuture moves every not-yet-due executable command by delta so queued
+// pointing follows a civil-time correction. Commands owned by passes in
+// exclude (active tracking or draining passes) are left untouched. The
+// in-memory shift rolls back if the queue cannot be persisted.
+func (q *CommandQueue) ShiftFuture(now time.Time, delta time.Duration, exclude map[string]bool) (int, error) {
+	if delta == 0 {
+		return 0, nil
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	shifted := make([]int, 0)
+	for index := range q.commands {
+		command := &q.commands[index]
+		if command.Retired || exclude[command.PassID] || !command.ExecuteAt.After(now) {
+			continue
+		}
+		command.ExecuteAt = command.ExecuteAt.Add(delta)
+		shifted = append(shifted, index)
+	}
+	if len(shifted) == 0 {
+		return 0, nil
+	}
+	if err := store.WriteJSON(q.path, q.commands); err != nil {
+		for _, index := range shifted {
+			q.commands[index].ExecuteAt = q.commands[index].ExecuteAt.Add(-delta)
+		}
+		return 0, err
+	}
+	return len(shifted), nil
+}
+
 func (q *CommandQueue) List(passID string) []PointingCommand {
 	q.mu.RLock()
 	defer q.mu.RUnlock()
